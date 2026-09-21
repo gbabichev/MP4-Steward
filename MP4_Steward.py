@@ -1183,6 +1183,7 @@ def run_ffmpeg(
     temp_file: str,
     duration: float | None,
     frame_rate: float | None,
+    enforce_progress_duration: bool = True,
 ) -> FFmpegRunResult:
     stderr_lines: deque[str] = deque(maxlen=80)
     start_time = time.time()
@@ -1303,18 +1304,39 @@ def run_ffmpeg(
         if duration and duration > 0 and final_media_time > 0:
             tolerance = max(5.0, min(30.0, duration * 0.005))
             if duration - final_media_time > tolerance:
-                return FFmpegRunResult(
-                    False,
-                    False,
-                    elapsed,
-                    "FFmpeg exited successfully but ended prematurely at "
-                    f"{final_media_time:.2f}s of {duration:.2f}s",
+                progress_message = (
+                    f"FFmpeg progress ended at {final_media_time:.2f}s of "
+                    f"{duration:.2f}s"
+                )
+                if enforce_progress_duration:
+                    return FFmpegRunResult(
+                        False,
+                        False,
+                        elapsed,
+                        progress_message,
+                    )
+                print(
+                    f"{SYMBOL_WARNING} {progress_message}; checking the completed "
+                    "remux with ffprobe instead"
                 )
         return FFmpegRunResult(True, False, elapsed)
 
-    diagnostic = "\n".join(stderr_lines)
-    if not diagnostic:
-        diagnostic = f"FFmpeg exited with code {return_code} without diagnostic output"
+    stderr_diagnostic = "\n".join(stderr_lines)
+    if return_code < 0:
+        signal_number = -return_code
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = "unknown signal"
+        diagnostic = (
+            f"FFmpeg was terminated by signal {signal_number} ({signal_name})"
+        )
+    else:
+        diagnostic = f"FFmpeg exited with code {return_code}"
+    if stderr_diagnostic:
+        diagnostic += f":\n{stderr_diagnostic}"
+    else:
+        diagnostic += " without diagnostic output"
     return FFmpegRunResult(False, False, elapsed, diagnostic)
 
 
@@ -1602,7 +1624,10 @@ def convert_to_mp4(
             issue = remux_compatibility_issue(input_probe, audio_mappings)
             if issue:
                 print(f"{SYMBOL_ERROR} Remux rejected: {issue}")
-                return ConversionResult("failed", issue)
+                return ConversionResult(
+                    "failed",
+                    f"Remux compatibility check failed: {issue}",
+                )
 
         subtitle_mappings = get_subtitle_streams(subtitle_probe, input_file)
         subtitle_sidecar: str | None = None
@@ -1669,7 +1694,11 @@ def convert_to_mp4(
             return ConversionResult("cancelled", "Cancelled", run_result.elapsed)
         if not run_result.success:
             print(f"{SYMBOL_ERROR} FFmpeg failed:\n{run_result.error}")
-            return ConversionResult("failed", run_result.error, run_result.elapsed)
+            return ConversionResult(
+                "failed",
+                f"Primary {mode} failed: {run_result.error}",
+                run_result.elapsed,
+            )
 
         if mode == "encode":
             mismatched_audio = audio_duration_mismatch_indexes(
@@ -1696,7 +1725,7 @@ def convert_to_mp4(
                 if not repair_result.success:
                     return ConversionResult(
                         "failed",
-                        repair_result.error,
+                        f"Audio repair failed: {repair_result.error}",
                         run_result.elapsed,
                     )
 
@@ -1732,6 +1761,7 @@ def convert_to_mp4(
                 temp_file,
                 media_duration(input_probe),
                 get_frame_rate(input_probe),
+                enforce_progress_duration=False,
             )
             run_result.elapsed += subtitle_result.elapsed
             try:
@@ -1756,7 +1786,11 @@ def convert_to_mp4(
         )
         if not valid:
             print(f"{SYMBOL_ERROR} Output validation failed: {validation_error}")
-            return ConversionResult("failed", validation_error, run_result.elapsed)
+            return ConversionResult(
+                "failed",
+                f"Final output validation failed: {validation_error}",
+                run_result.elapsed,
+            )
 
         print(f"{SYMBOL_SUCCESS} FFmpeg completed and the output passed validation")
         show_time(run_result.elapsed)
@@ -1766,10 +1800,13 @@ def convert_to_mp4(
         diagnostic = (error.stderr or "").strip() if hasattr(error, "stderr") else ""
         reason = diagnostic or str(error)
         print(f"{SYMBOL_ERROR} Probe or FFmpeg error: {reason}")
-        return ConversionResult("failed", reason)
+        return ConversionResult("failed", f"Media probe failed: {reason}")
     except (json.JSONDecodeError, OSError, RuntimeError, ValueError) as error:
         print(f"{SYMBOL_ERROR} Unexpected processing error: {error}")
-        return ConversionResult("failed", str(error))
+        return ConversionResult(
+            "failed",
+            f"Unexpected processing error: {error}",
+        )
     finally:
         encoded_av_file = locals().get("encoded_av_file")
         if encoded_av_file and encoded_av_file != temp_file and os.path.exists(encoded_av_file):
@@ -1799,6 +1836,33 @@ def paths_refer_to_same_file(first_path: str, second_path: str) -> bool:
     except OSError:
         pass
     return os.path.realpath(first_path) == os.path.realpath(second_path)
+
+
+def log_unsuccessful_conversion(
+    file_name: str,
+    input_file: str,
+    output_file: str,
+    result: ConversionResult,
+) -> None:
+    """Persist a complete, grep-friendly summary for every unsuccessful file."""
+    if result.status == "skipped":
+        heading = "SKIPPED"
+        symbol = SYMBOL_WARNING
+    elif result.status == "cancelled":
+        heading = "CANCELLED"
+        symbol = SYMBOL_WARNING
+    else:
+        heading = "FAILED"
+        symbol = SYMBOL_ERROR
+
+    reason = result.reason.strip() or "No failure reason was reported"
+    print(f"{symbol}{heading}: {file_name}")
+    print(f"{symbol}Reason: {reason}")
+    print(f"{SYMBOL_INFO}Source: {input_file}")
+    print(f"{SYMBOL_INFO}Intended output: {output_file}")
+    print(f"{SYMBOL_INFO}Original kept: {'yes' if os.path.exists(input_file) else 'no'}")
+    if result.elapsed > 0:
+        print(f"{SYMBOL_INFO}Failed after: {format_duration(result.elapsed)}")
 
 
 def commit_validated_output(
@@ -1957,7 +2021,15 @@ def process_folder(
         print(f"{SYMBOL_INFO} Output: {output_file}")
 
         if os.path.exists(output_file) and not replacing_source:
-            print(f"{SYMBOL_ERROR} Destination already exists; original was kept: {output_file}")
+            log_unsuccessful_conversion(
+                file_name,
+                input_file,
+                output_file,
+                ConversionResult(
+                    "failed",
+                    f"Destination already exists: {output_file}",
+                ),
+            )
             failed += 1
             continue
 
@@ -1973,10 +2045,16 @@ def process_folder(
             )
             if not result.success:
                 totalRunTime += result.elapsed
+                log_unsuccessful_conversion(
+                    file_name,
+                    input_file,
+                    output_file,
+                    result,
+                )
                 if result.status == "skipped":
                     skipped += 1
                 elif result.status == "cancelled":
-                    print(f"{SYMBOL_WARNING} Batch cancelled; original was kept")
+                    print(f"{SYMBOL_WARNING} Batch cancelled")
                 else:
                     failed += 1
                 continue
@@ -2002,7 +2080,15 @@ def process_folder(
             )
         except OSError as error:
             failed += 1
-            print(f"{SYMBOL_ERROR} Finalizing output failed; original was kept: {error}")
+            log_unsuccessful_conversion(
+                file_name,
+                input_file,
+                output_file,
+                ConversionResult(
+                    "failed",
+                    f"Finalizing validated output failed: {error}",
+                ),
+            )
         finally:
             if os.path.exists(temp_output):
                 try:

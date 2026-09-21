@@ -22,7 +22,7 @@ For each supported video in the completed SAB folder, the converter:
 4. In `SAB-smart.py`, measures the input size against its runtime. Files at or below 25 MB/min are remuxed when their selected tracks are MP4-compatible; larger or incompatible files use H.265. `SAB-encode.py` always uses H.265 with CRF 23 and the `fast` preset. Apple-compatible AAC, ALAC, AC-3, and E-AC-3 audio is copied unchanged. MP3 and other incompatible audio are converted to high-quality AAC at a channel-appropriate bitrate while preserving the original mono, stereo, 5.1, or 7.1 layout.
 5. In `SAB-remux.py`, copies compatible video and audio streams without re-encoding; incompatible inputs fail safely and should be processed with the encode script instead.
 6. Keeps one compatible embedded full English subtitle track and converts it to MP4 text subtitles. Embedded text subtitles always take priority. When no usable embedded text subtitle exists, a matching sibling SRT is added automatically. Selection prefers ordinary subtitles, then SDH, then forced-only subtitles; cue counts and accessibility markers resolve unclear labels. Undefined-language embedded subtitles are used only when no English track is identified.
-   Long video encodes complete and validate their video/audio output before subtitles are introduced in a fast second remux. This prevents sparse subtitle streams from making some FFmpeg versions finish a long encode prematurely.
+   Long video encodes complete and validate their video/audio output before subtitles are introduced in a fast second remux. This prevents sparse subtitle streams from making some FFmpeg versions finish a long encode prematurely. The fast subtitle remux is judged by its exit status and the completed file's FFprobe validation rather than FFmpeg's final progress timestamp, which can report the last subtitle packet instead of the finished media duration.
 7. Preserves language and useful dispositions, standardizes subtitle labels, and removes source attribution/title metadata.
 8. Writes to a temporary file and validates it with FFprobe.
 9. Applies the cleaned final filename and moves the validated MP4 beside the original source.
@@ -137,7 +137,12 @@ By default:
 - The active log is limited to roughly 5 MB before rotation.
 - Three older logs are retained as `.1`, `.2`, and `.3`.
 - Frequent progress messages are excluded from the file log.
-- FFmpeg failures include only the final meaningful diagnostic lines.
+- Every skipped, cancelled, or failed file ends with a searchable summary that
+  includes its filename, failure stage and reason, source, intended output,
+  whether the original still exists, and elapsed time when available.
+- FFmpeg failures include the process exit code (or terminating signal) and only
+  the final meaningful diagnostic lines. This also covers secondary operations
+  such as audio repair and subtitle remuxing.
 
 The following environment variables can change the defaults:
 
