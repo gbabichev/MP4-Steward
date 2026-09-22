@@ -1,6 +1,9 @@
-# MP4 Converter for SABnzbd
+# MP4 Steward
 
-This folder contains the automatic Python version of MP4 Tool. It is intended to run after SABnzbd finishes downloading and unpacking a job.
+MP4 Steward is the unattended Python companion to MP4 Tool. It can run directly
+from the command line or after SABnzbd finishes downloading and unpacking a job.
+It follows the same core Smart, Encode, Remux, preferred-track, metadata-cleanup,
+and output-validation rules as the Swift app.
 
 The short version: SAB calls `SAB-smart.py` to choose remux or H.265 automatically, `SAB-encode.py` to always encode, or `SAB-remux.py` to only repackage compatible streams. All three entry points use `MP4_Steward.py` for processing and safety checks.
 
@@ -46,7 +49,7 @@ In SABnzbd, select the script appropriate for each category:
 
 SAB passes the completed download folder as the first argument automatically.
 
-Both SAB entry points use:
+All three SAB entry points use:
 
 - The completed download folder as both the input and output location
 - The validated, automatically renamed MP4 placed beside its source file
@@ -193,7 +196,7 @@ The converter no longer forces every audio track to 5.1. It preserves the layout
 
 Encoding the video no longer means automatically re-encoding its selected audio. AAC, ALAC, AC-3, and E-AC-3 are copied without quality loss. MP3 and other formats use AAC at 128 kb/s for mono, 256 kb/s for stereo, 384 kb/s for 3–4 channels, 512 kb/s for 5–6 channels, and 768 kb/s for 7–8 channels.
 
-It does not automatically repair a source that was already authored as fake 5.1. Use the Swift app's MP4 Validator and audio repair feature for those existing files.
+It does not automatically repair a source that was already authored as fake 5.1. Use the Swift app's Inspect & Repair compatibility checks and audio repair feature for those existing files.
 
 ## Troubleshooting checklist
 
