@@ -5,13 +5,13 @@ from the command line or after SABnzbd finishes downloading and unpacking a job.
 It follows the same core Smart, Encode, Remux, preferred-track, metadata-cleanup,
 and output-validation rules as the Swift app.
 
-The short version: SAB calls `SAB-smart.py` to choose remux or H.265 automatically, `SAB-encode.py` to always encode, or `SAB-remux.py` to only repackage compatible streams. All three entry points use `MP4_Steward.py` for processing and safety checks.
+The short version: SAB calls `SAB-smart.py` to choose remux or H.265 automatically, `SAB-encode.py` to always encode, or `SAB-remux.py` to try remuxing first with H.265 recovery if needed. All three entry points use `MP4_Steward.py` for processing and safety checks.
 
 ## Files in this folder
 
 - `SAB-smart.py` is the recommended SAB entry point. It remuxes compact compatible files and encodes larger or incompatible files.
 - `SAB-encode.py` is the SAB entry point for H.265 encoding.
-- `SAB-remux.py` is the SAB entry point for remuxing compatible tracks without re-encoding.
+- `SAB-remux.py` is the SAB entry point for trying a lossless remux first, with H.265 MP4 encoding if remuxing is incompatible or fails.
 - `MP4_Steward.py` contains the actual probing, FFmpeg conversion, validation, file handling, progress reporting, and logging.
 - `MP4_Converter.log` is created automatically when the script runs. It is not part of the source code and should not be committed.
 
@@ -23,9 +23,9 @@ For each supported video in the completed SAB folder, the converter:
 2. Selects one preferred main English audio track. If no track is explicitly English, undefined-language audio is used as a fallback because many releases are not labeled correctly. Commentary, audio-description, and dubbed tracks are avoided when a main track is available.
 3. Skips the file before encoding if no suitable audio track exists.
 4. In `SAB-smart.py`, measures the input size against its runtime. Files at or below 25 MB/min are remuxed when their selected tracks are MP4-compatible; larger or incompatible files use H.265. `SAB-encode.py` always uses H.265 with CRF 23 and the `fast` preset. Apple-compatible AAC, ALAC, AC-3, and E-AC-3 audio is copied unchanged. MP3 and other incompatible audio are converted to high-quality AAC at a channel-appropriate bitrate while preserving the original mono, stereo, 5.1, or 7.1 layout.
-5. In `SAB-remux.py`, copies compatible video and audio streams without re-encoding; incompatible inputs fail safely and should be processed with the encode script instead.
+5. In `SAB-remux.py`, copies compatible video and audio streams without re-encoding. Incompatible inputs encode directly as H.265 MP4. Failed remuxes (including Smart-mode remuxes) get one H.265 MP4 encode attempt from the original input, retaining compatible audio. Cancellation, full disks, and permission errors do not trigger an encode retry.
 6. Keeps one compatible embedded full English subtitle track and converts it to MP4 text subtitles. Embedded text subtitles always take priority. When no usable embedded text subtitle exists, a matching sibling SRT is added automatically. Selection prefers ordinary subtitles, then SDH, then forced-only subtitles; cue counts and accessibility markers resolve unclear labels. Undefined-language embedded subtitles are used only when no English track is identified.
-   Long video encodes complete and validate their video/audio output before subtitles are introduced in a fast second remux. This prevents sparse subtitle streams from making some FFmpeg versions finish a long encode prematurely. The fast subtitle remux is judged by its exit status and the completed file's FFprobe validation rather than FFmpeg's final progress timestamp, which can report the last subtitle packet instead of the finished media duration.
+   Long video encodes complete and validate their video/audio output before subtitles are introduced in a fast second remux. This prevents sparse subtitle streams from making some FFmpeg versions finish a long encode prematurely. All conversion stages are judged by their exit status and the completed file's FFprobe validation rather than FFmpeg's final progress timestamp, which can report the last subtitle packet instead of the finished media duration.
 7. Preserves language and useful dispositions, standardizes subtitle labels, and removes source attribution/title metadata.
 8. Writes to a temporary file and validates it with FFprobe.
 9. Applies the cleaned final filename and moves the validated MP4 beside the original source.
@@ -45,7 +45,7 @@ In SABnzbd, select the script appropriate for each category:
 
 - Use `SAB-smart.py` for the same automatic size/runtime decision as MP4 Tool. This is the recommended default.
 - Use `SAB-encode.py` when the downloaded video should be converted to H.265 MP4.
-- Use `SAB-remux.py` when compatible streams should only be repackaged as MP4 without re-encoding.
+- Use `SAB-remux.py` to prefer repackaging compatible streams as MP4, with one H.265 encode attempt if remuxing fails.
 
 SAB passes the completed download folder as the first argument automatically.
 
@@ -180,13 +180,11 @@ A skipped file intentionally returns a failure to SAB so that it does not silent
 
 ## Remux mode
 
-Remux mode copies compatible video and audio streams without re-encoding them. It rejects known incompatible MP4 combinations, including unsupported video codecs, DTS, floating-point PCM, and other unsupported audio formats.
-
-For incompatible files, use `encode` mode instead.
+Remux mode first tries copying compatible video and audio streams without re-encoding them. Known incompatible combinations—including unsupported video codecs, DTS, floating-point PCM, and other unsupported audio formats—go directly to H.265 MP4 encoding. A failed or incomplete remux gets one encode attempt from the original input. Cancellation, full disks, and permission errors stop processing without a retry. Every successful output must pass validation before it replaces the source.
 
 ## Smart mode
 
-Smart mode uses the same size-per-runtime rule as MP4 Tool. It calculates the input's decimal megabytes per minute and selects remux when the result is at or below the configured target. Before remuxing, it checks video codec, audio codec, channel-layout safety, and the selected tracks. If remux is unsafe—or file size/runtime cannot be read—it automatically falls back to H.265 encoding.
+Smart mode uses the same size-per-runtime rule as MP4 Tool. It calculates the input's decimal megabytes per minute and selects remux when the result is at or below the configured target. Before remuxing, it checks video codec, audio codec, channel-layout safety, and the selected tracks. If remux is unsafe—or file size/runtime cannot be read—it automatically falls back to H.265 encoding. If a selected remux fails or produces an incomplete output, it also retries once as H.265 MP4. Successful output is always MP4; if recovery fails, the original is kept.
 
 The default target is 25 MB/min. Override it with `smart_target=30` during a manual run or set `MP4_SMART_TARGET_MB_PER_MINUTE=30` for SAB.
 
@@ -233,3 +231,18 @@ Before putting a new version back into SAB:
 3. Test with a copied short video first.
 4. Confirm SAB shows live progress.
 5. Confirm the output plays correctly before using it on the full queue.
+
+## Recovery regression tests
+
+With Python 3 and FFmpeg/FFprobe on PATH, run:
+
+```sh
+python3 tests/test_remux_recovery.py
+# Also test existing MKV files, without changing or deleting the originals:
+python3 tests/test_remux_recovery.py --samples /path/to/samples
+```
+
+The suite generates temporary media and injects short subtitle progress, remux
+errors, and truncated outputs. It checks H.265 recovery, retry limits, cancellation,
+storage errors, incompatible inputs, and Smart-mode recovery. Completed outputs
+must pass the converter's normal stream, duration, layout, and audio decode checks.

@@ -16,7 +16,7 @@ Common examples:
     # Encode into a separate library, creating one cleaned subfolder per video.
     python3 MP4_Steward.py "/downloads/finished" "/media/movies" encode=true subfolders=true rename=true
 
-    # Remux compatible tracks without re-encoding, beside the source files.
+    # Prefer remuxing, with H.265 recovery if needed, beside the source files.
     python3 MP4_Steward.py "/downloads/movie" "/downloads/movie" remux=true subfolders=false rename=true
 
     # Remux to another folder while preserving the original filenames.
@@ -1183,8 +1183,10 @@ def run_ffmpeg(
     temp_file: str,
     duration: float | None,
     frame_rate: float | None,
-    enforce_progress_duration: bool = True,
 ) -> FFmpegRunResult:
+    # Cancellation can arrive while probing or between conversion stages.
+    if CANCELLATION_REQUESTED.is_set():
+        return FFmpegRunResult(False, True, 0.0, "Cancelled")
     stderr_lines: deque[str] = deque(maxlen=80)
     start_time = time.time()
     latest_media_time = 0.0
@@ -1206,6 +1208,8 @@ def run_ffmpeg(
         creationflags=creation_flags,
     )
     _set_active_process(process)
+    if CANCELLATION_REQUESTED.is_set():
+        _terminate_process(process)
 
     def collect_stderr() -> None:
         if process.stderr is None:
@@ -1291,6 +1295,10 @@ def run_ffmpeg(
         return_code = process.wait()
     finally:
         stderr_thread.join(timeout=1)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None and not stderr_thread.is_alive():
+            process.stderr.close()
         clear_progress_line()
         _set_active_process(None)
 
@@ -1298,6 +1306,9 @@ def run_ffmpeg(
     if CANCELLATION_REQUESTED.is_set():
         return FFmpegRunResult(False, True, elapsed, "Cancelled")
     if return_code == 0:
+        # Mux progress may stop at the final subtitle cue. Frame count divided
+        # by nominal frame rate can also understate VFR duration. Warn here;
+        # conversion and repair callers validate the actual output tracks.
         final_media_time = latest_timestamp_time
         if final_media_time <= 0 and frame_rate and latest_frame is not None:
             final_media_time = latest_frame / frame_rate
@@ -1308,16 +1319,9 @@ def run_ffmpeg(
                     f"FFmpeg progress ended at {final_media_time:.2f}s of "
                     f"{duration:.2f}s"
                 )
-                if enforce_progress_duration:
-                    return FFmpegRunResult(
-                        False,
-                        False,
-                        elapsed,
-                        progress_message,
-                    )
                 print(
                     f"{SYMBOL_WARNING} {progress_message}; checking the completed "
-                    "remux with ffprobe instead"
+                    "output with ffprobe instead"
                 )
         return FFmpegRunResult(True, False, elapsed)
 
@@ -1588,7 +1592,45 @@ def convert_to_mp4(
     mode: str,
     smart_target_mb_per_minute: float = DEFAULT_SMART_TARGET_MB_PER_MINUTE,
 ) -> ConversionResult:
-    """Probe, convert/remux, and validate a single file."""
+    """Probe, convert/remux, and validate; retry a failed remux once as H.265."""
+    started = time.monotonic()
+    if CANCELLATION_REQUESTED.is_set():
+        return ConversionResult("cancelled", "Cancelled")
+
+    def recover_from_remux_failure(reason: str) -> ConversionResult:
+        elapsed = time.monotonic() - started
+        if CANCELLATION_REQUESTED.is_set():
+            return ConversionResult("cancelled", "Cancelled", elapsed)
+        if mode != "remux" or any(
+            diagnostic in reason.lower()
+            for diagnostic in (
+                "no space left", "disk full", "permission denied", "read-only file system",
+            )
+        ):
+            return ConversionResult("failed", reason, elapsed)
+
+        print(f"{SYMBOL_WARNING} Remux failed: {reason}")
+        print(
+            f"{SYMBOL_INFO} Retrying from the original input as H.265 MP4; "
+            "compatible audio will be preserved."
+        )
+        try:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        except OSError as error:
+            return ConversionResult(
+                "failed",
+                f"Remux failed: {reason}. Could not clear temporary output: {error}",
+                elapsed,
+            )
+        # Explicit encode mode cannot re-enter the remux fallback.
+        result = convert_to_mp4(input_file, temp_file, "encode", smart_target_mb_per_minute)
+        result.elapsed += elapsed
+        if result.status not in {"success", "cancelled"}:
+            result.reason = f"Remux failed: {reason}. H.265 MP4 fallback failed: {result.reason}"
+            result.status = "failed"
+        return result
+
     try:
         input_probe = probe_media(input_file)
         audio_probe = probe_media(input_file, "a")
@@ -1623,11 +1665,11 @@ def convert_to_mp4(
         if mode == "remux":
             issue = remux_compatibility_issue(input_probe, audio_mappings)
             if issue:
-                print(f"{SYMBOL_ERROR} Remux rejected: {issue}")
-                return ConversionResult(
-                    "failed",
-                    f"Remux compatibility check failed: {issue}",
+                print(
+                    f"{SYMBOL_WARNING} Remux unavailable: {issue}; "
+                    "falling back to H.265 MP4 encoding."
                 )
+                mode = "encode"
 
         subtitle_mappings = get_subtitle_streams(subtitle_probe, input_file)
         subtitle_sidecar: str | None = None
@@ -1694,11 +1736,7 @@ def convert_to_mp4(
             return ConversionResult("cancelled", "Cancelled", run_result.elapsed)
         if not run_result.success:
             print(f"{SYMBOL_ERROR} FFmpeg failed:\n{run_result.error}")
-            return ConversionResult(
-                "failed",
-                f"Primary {mode} failed: {run_result.error}",
-                run_result.elapsed,
-            )
+            return recover_from_remux_failure(f"Primary {mode} failed: {run_result.error}")
 
         if mode == "encode":
             mismatched_audio = audio_duration_mismatch_indexes(
@@ -1738,10 +1776,8 @@ def convert_to_mp4(
                 expected_subtitle_mappings=[],
             )
             if not valid:
-                return ConversionResult(
-                    "failed",
-                    f"Encoded video/audio validation failed: {validation_error}",
-                    run_result.elapsed,
+                return recover_from_remux_failure(
+                    f"Encoded video/audio validation failed: {validation_error}"
                 )
 
             subtitle_source = subtitle_sidecar or input_file
@@ -1761,7 +1797,6 @@ def convert_to_mp4(
                 temp_file,
                 media_duration(input_probe),
                 get_frame_rate(input_probe),
-                enforce_progress_duration=False,
             )
             run_result.elapsed += subtitle_result.elapsed
             try:
@@ -1771,10 +1806,8 @@ def convert_to_mp4(
             if subtitle_result.cancelled:
                 return ConversionResult("cancelled", "Cancelled", run_result.elapsed)
             if not subtitle_result.success:
-                return ConversionResult(
-                    "failed",
-                    f"Subtitle remux failed: {subtitle_result.error}",
-                    run_result.elapsed,
+                return recover_from_remux_failure(
+                    f"Subtitle remux failed: {subtitle_result.error}"
                 )
 
         valid, validation_error = validate_output(
@@ -1786,12 +1819,12 @@ def convert_to_mp4(
         )
         if not valid:
             print(f"{SYMBOL_ERROR} Output validation failed: {validation_error}")
-            return ConversionResult(
-                "failed",
-                f"Final output validation failed: {validation_error}",
-                run_result.elapsed,
+            return recover_from_remux_failure(
+                f"Final output validation failed: {validation_error}"
             )
 
+        if CANCELLATION_REQUESTED.is_set():
+            return ConversionResult("cancelled", "Cancelled", run_result.elapsed)
         print(f"{SYMBOL_SUCCESS} FFmpeg completed and the output passed validation")
         show_time(run_result.elapsed)
         return ConversionResult("success", elapsed=run_result.elapsed)

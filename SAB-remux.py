@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""SABnzbd entry point for unattended MP4 remuxing.
+"""SABnzbd entry point for MP4 remuxing with H.265 recovery if needed.
 
 Usage:
     Configure SABnzbd to run this file as a post-processing script. SAB passes
