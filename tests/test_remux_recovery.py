@@ -126,6 +126,11 @@ class RemuxRecoveryTests(unittest.TestCase):
             self.assertEqual(steward.get_video_codec(probe), codec)
             self.assertEqual(sum(s["codec_type"] == "subtitle" for s in probe["streams"]), 1)
             self.assertTrue(all(command[-1].endswith(".mp4") for command in commands))
+            # Every MP4 written must use 500 ms interleave chunks; tiny chunks make
+            # tvOS drop AirPlay/HomePod audio.
+            for command in commands:
+                self.assertIn("-chunk_duration", command)
+                self.assertEqual(command[command.index("-chunk_duration") + 1], "500000")
             self.assertIn("checking the completed output with ffprobe", logs.getvalue())
         if case == "truncated":
             self.assertIn("video duration mismatch", logs.getvalue())

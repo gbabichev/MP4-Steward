@@ -52,6 +52,9 @@ LOGFILE = os.environ.get(
     "MP4_CONVERTER_LOG",
     os.path.join(SCRIPT_DIR, "MP4_Converter.log"),
 )
+# Interleave audio/video in 500 ms chunks (same as `MP4Box -inter 500`). Tiny chunks
+# make tvOS drop AirPlay/HomePod audio after a few minutes of playback.
+AUDIO_VIDEO_CHUNK_DURATION_US = "500000"
 LOG_MAX_BYTES = max(int(os.environ.get("MP4_LOG_MAX_BYTES", 5 * 1024 * 1024)), 1024)
 LOG_BACKUP_COUNT = max(int(os.environ.get("MP4_LOG_BACKUP_COUNT", 3)), 0)
 OS_NAME = platform.system()
@@ -1100,6 +1103,7 @@ def build_ffmpeg_cmd(
 
     command.extend([
         "-movflags", "+faststart",
+        "-chunk_duration", AUDIO_VIDEO_CHUNK_DURATION_US,
         "-loglevel", "error",
         "-nostats",
         "-progress", "pipe:1",
@@ -1161,6 +1165,7 @@ def build_subtitle_mux_cmd(
         "-map_metadata", "-1",
         "-map_chapters", "-1",
         "-movflags", "+faststart",
+        "-chunk_duration", AUDIO_VIDEO_CHUNK_DURATION_US,
         "-loglevel", "error",
         "-nostats",
         "-progress", "pipe:1",
@@ -1428,6 +1433,7 @@ def rebuild_incomplete_audio_tracks(
         "-map_metadata", "-1",
         "-map_chapters", "-1",
         "-movflags", "+faststart",
+        "-chunk_duration", AUDIO_VIDEO_CHUNK_DURATION_US,
         "-loglevel", "error",
         "-nostats",
         "-progress", "pipe:1",
